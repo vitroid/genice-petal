@@ -9,24 +9,13 @@ Petal is an order parameter reflecting the local network topology around a given
 A petal graph at a node consists of rings that contain the given node.
 
 options:
-    png      Draw the hydrogen bonds with a rainbow palette according to the twist value in PNG format.
-    png:CM   Draw the hydrogen bonds with color-mixing scheme in PNG format.
-    png:DB   Draw the hydrogen bonds with decision-boundary coloring scheme in PNG format.
-    png:SB   Draw the hydrogen bonds with simple boundary coloring scheme in PNG format.
-    svg      Draw the hydrogen bonds with a rainbow palette according to the twist value in SVG format.
-    svg:CM   Draw the hydrogen bonds with color-mixing scheme in SVG format.
-    svg:DB   Draw the hydrogen bonds with decision-boundary coloring scheme in SVG format.
-    svg:SB   Draw the hydrogen bonds with simple boundary coloring scheme in SVG format.
-    yaplot   Draw the hydrogen bonds with a rainbow palette according to the twist value in YaPlot format.
-    shadow   Draw shadows to the atoms (PNG and SVG)
-    Ih=filename.twhist   Specify the (two-dimensional) histogram of twist parameter in pure ice Ih.
-    Ic=filename.twhist   Specify the (two-dimensional) histogram of twist parameter in pure ice Ic.
-    LDL=filename.twhist  Specify the (two-dimensional) histogram of twist parameter in pure LDL.
-    HDL=filename.twhist  Specify the (two-dimensional) histogram of twist parameter in pure HDL.
-    rotatex=30   Rotate the picture (SVG and PNG)
-    rotatey=30   Rotate the picture (SVG and PNG)
-    rotatez=30   Rotate the picture (SVG and PNG)
 """
+
+desc = { "ref": {},
+         "brief": "Petal OP",
+         "usage": __doc__,
+         }
+
 
 # standard python modules
 import sys
@@ -43,6 +32,7 @@ import networkx as nx
 from countrings import countrings_nx as cr
 import graphstat
 from graphstat import graphstat_sqlite3
+import yaplotlib as yp
 
 
 def is_spanning(ring, coord):
@@ -66,19 +56,23 @@ def prepare(g, coord, maxring=7):
             
     rings = []
     subgraphs = defaultdict(nx.Graph)
-    for i, ring in enumerate(cr.CountRings(g).rings_iter(maxring)):
+    rings_at = defaultdict(set)
+    for ring in cr.CountRings(g).rings_iter(maxring):
         # make a ring list
         assert not is_spanning(ring, coord), "Some ring is spanning the cell."
         rings.append(ring)
+        ringid = len(rings) - 1
+        for node in ring:
+            rings_at[node].add(ringid)
         for node in ring:
             # make a graph made of rings owned by the node
             for edge in ring_to_edge(ring):
                 subgraphs[node].add_edge(*edge)
-    return rings, subgraphs
+    return rings, subgraphs, rings_at
 
-def stat(subgraphs, gc):
+def collect(subgraphs, gc):
     """
-    Make a statistics of petal types
+    Collect petal types
     """
     logger = getLogger()
     ids = dict()
@@ -86,38 +80,70 @@ def stat(subgraphs, gc):
         id =  gc.query_id(subgraphs[node])
         if id < 0:
             id = gc.register()
-            logger.info("  New petal type {0}".format(id))
+            logger.debug("  New petal type {0}".format(id))
         ids[node] = id
     return ids
 
+
+def draw_ring(nodes, positions,cell, center):
+    logger = getLogger()
+    v = positions[nodes]
+    logger.debug(v)
+    d = v - center
+    d -= np.floor(d+0.5)
+    return yp.Polygon((center+d*0.8) @ cell)
+
 def hook2(lattice):
     global options
-    lattice.logger.info("Hook2: Petal statistics.")
+    logger = getLogger()
+    logger.info("Hook2: Petal statistics.")
     database = options.database
     if database is None:
-        lattice.logger.info("  Using temporary database. (volatile)")
+        logger.info("  Using temporary database. (volatile)")
         gc = graphstat.GraphStat()
     elif database[:4] == "http":
-        lattice.logger.info("  Using MySQL: {0}".format(database))
+        logger.info("  Using MySQL: {0}".format(database))
         gc = graphstat_mysql.GraphStat(database)
     else:
-        lattice.logger.info("  Using local Sqlite3: {0}".format(database))
+        logger.info("  Using local Sqlite3: {0}".format(database))
         import os.path
         create = not os.path.isfile(database)
         if create:
-            lattice.logger.info("  Create new DB.")
+            logger.info("  Create new DB.")
         gc = graphstat_sqlite3.GraphStat(database, create=create)
     
-    cell = lattice.repcell 
+    cell = lattice.repcell.mat
     positions = lattice.reppositions
     graph = nx.Graph(lattice.graph) #undirected
-    rings, subgraphs = prepare(graph, positions)
-    ids = stat(subgraphs, gc)
+    rings, subgraphs, rings_at = prepare(graph, positions)
+    gids = collect(subgraphs, gc)
     if options.json:
         # In JSON, a key must be a string.
-        ids = {str(i):ids[i] for i in ids}
+        ids = {str(i):gids[i] for i in gids}
         print(json.dumps(ids, indent=2, sort_keys=True))
-    lattice.logger.info("Hook2: end.")
+    elif options.yaplot:
+        # Draw top 10 most popular petal types with Yaplot.
+        count = defaultdict(int)
+        typical = dict()
+        for node in gids:
+            count[gids[node]] += 1
+            typical[gids[node]] = node
+        top10 = sorted(count, key=lambda gid: -count[gid])[:30]
+        ranks = {gid:i for i,gid in enumerate(top10)}
+        for i, gid in enumerate(ranks):
+            node = typical[gid]
+            logger.info("  Ranking {0}: {2} x {1} (id {3})".format(i, [len(rings[ringid]) for ringid in rings_at[node]], count[gid], gid))
+        s = ""
+        for node in gids:
+            gid = gids[node]
+            if gid in ranks:
+                rank = ranks[gid]
+                s += yp.Color(rank+3)
+                s += yp.Layer(rank+1)
+                for ringid in rings_at[node]:
+                    s += draw_ring(rings[ringid], positions,cell=cell, center=positions[node])
+        print(s)
+    logger.info("Hook2: end.")
 
 
     
@@ -127,8 +153,8 @@ def hook0(lattice, arg):
     logger.info("Hook0: ArgParser.")
     options = AttrDict()
     options.database = None
-    options.json = True
-    
+    options.json = False
+    options.yaplot = False
     if arg == "":
         pass
     else:
@@ -139,6 +165,12 @@ def hook0(lattice, arg):
                 logger.info("Wrong option with arguments: {0} := {1}".format(key,value))
             else:
                 logger.info("Flags: {0}".format(a))
+                if a == "yaplot":
+                    options.yaplot = True
+                    continue
+                if a == "json":
+                    options.json = True
+                    continue
                 options.database = a
     logger.info("Hook0: end.")
 
